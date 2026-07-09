@@ -28,6 +28,7 @@ function getLanguageLabel(languageTag: string) {
 
 export function useSpeechToText(languageTag: string) {
   const [isListening, setIsListening] = useState(false)
+  const [isPaused, setIsPaused] = useState(false)
   const [transcript, setTranscript] = useState('')
   const [interimTranscript, setInterimTranscript] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -90,6 +91,12 @@ export function useSpeechToText(languageTag: string) {
 
   const stopRecognition = useCallback(() => {
     shouldContinueRef.current = false
+    clearRetryTimeout()
+    stopRecognitionInstance()
+    setIsReconnecting(false)
+  }, [clearRetryTimeout, stopRecognitionInstance])
+
+  const pauseRecognition = useCallback(() => {
     clearRetryTimeout()
     stopRecognitionInstance()
     setIsReconnecting(false)
@@ -200,12 +207,13 @@ export function useSpeechToText(languageTag: string) {
     }
   }, [appendFinalTranscript, clearRetryTimeout, languageTag, stopRecognitionInstance])
 
-  const start = useCallback(async () => {
+  const start = useCallback(async (deviceId?: string) => {
     setError(null)
     setWarning(null)
     setTranscript('')
     setInterimTranscript('')
     setIsReconnecting(false)
+    setIsPaused(false)
     audioChunksRef.current = []
     networkRetryCountRef.current = 0
     shouldContinueRef.current = true
@@ -231,7 +239,15 @@ export function useSpeechToText(languageTag: string) {
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const stream = await navigator.mediaDevices.getUserMedia(
+        deviceId
+          ? {
+              audio: {
+                deviceId: { exact: deviceId },
+              },
+            }
+          : { audio: true },
+      )
       mediaStreamRef.current = stream
       setAudioStream(stream)
 
@@ -261,6 +277,7 @@ export function useSpeechToText(languageTag: string) {
     if (!isListening && !shouldContinueRef.current) return null
 
     setIsListening(false)
+    setIsPaused(false)
     stopRecognition()
 
     const pendingInterim = interimTranscriptRef.current
@@ -316,6 +333,41 @@ export function useSpeechToText(languageTag: string) {
     }
   }, [isListening, languageTag, stopMedia, stopRecognition])
 
+  const togglePause = useCallback(() => {
+    if (!isListening) return
+
+    const recorder = mediaRecorderRef.current
+    if (!recorder || recorder.state === 'inactive') return
+
+    if (isPaused) {
+      try {
+        recorder.resume()
+      } catch {
+        return
+      }
+      setIsPaused(false)
+      shouldContinueRef.current = true
+      attachRecognition()
+      return
+    }
+
+    try {
+      recorder.pause()
+    } catch {
+      return
+    }
+    setIsPaused(true)
+    pauseRecognition()
+    setInterimTranscript('')
+  }, [attachRecognition, isListening, isPaused, pauseRecognition])
+
+  const clearTranscript = useCallback(() => {
+    setTranscript('')
+    setInterimTranscript('')
+    transcriptRef.current = ''
+    interimTranscriptRef.current = ''
+  }, [])
+
   useEffect(() => {
     return () => {
       shouldContinueRef.current = false
@@ -327,6 +379,7 @@ export function useSpeechToText(languageTag: string) {
 
   return {
     isListening,
+    isPaused,
     isProcessing,
     isReconnecting,
     audioStream,
@@ -335,7 +388,9 @@ export function useSpeechToText(languageTag: string) {
     error,
     warning,
     setTranscript,
+    clearTranscript,
     start,
     stop,
+    togglePause,
   }
 }
