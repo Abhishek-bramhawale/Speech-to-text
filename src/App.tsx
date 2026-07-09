@@ -18,6 +18,7 @@ type StoredRecording = {
 }
 
 const STORAGE_KEY = 'speech-to-text:recordings:v1'
+const MAX_STORED_CLIPS = 25
 
 function formatWithPunctuation(rawText: string): string {
   const normalized = rawText.replace(/\s+/g, ' ').trim()
@@ -25,6 +26,13 @@ function formatWithPunctuation(rawText: string): string {
   const withCapitalizedStart = normalized.charAt(0).toUpperCase() + normalized.slice(1)
   const endsWithPunctuation = /[.!?]$/.test(withCapitalizedStart)
   return endsWithPunctuation ? withCapitalizedStart : `${withCapitalizedStart}.`
+}
+
+function getStorageErrorMessage(error: unknown) {
+  if (error instanceof DOMException && error.name === 'QuotaExceededError') {
+    return 'Browser storage is full. Old clips were trimmed to keep recent ones.'
+  }
+  return 'Could not persist all clips in browser storage.'
 }
 
 async function blobToDataUrl(blob: Blob): Promise<string> {
@@ -50,14 +58,104 @@ function dataUrlToBlob(dataUrl: string, fallbackType: string) {
   return new Blob([bytes], { type: mimeType })
 }
 
+function dedupeMicrophones(devices: MediaDeviceInfo[]) {
+  const filtered = devices.filter(
+    (device) =>
+      device.kind === 'audioinput' &&
+      device.deviceId !== 'default' &&
+      device.deviceId !== 'communications',
+  )
+
+  const seen = new Set<string>()
+  return filtered.filter((device) => {
+    const normalizedLabel = device.label.trim().toLowerCase()
+    const key = normalizedLabel
+      ? `${device.groupId || ''}::${normalizedLabel}`
+      : `id::${device.deviceId}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+async function getCorrectedText(rawText: string, languageTag: string) {
+  const normalized = rawText.replace(/\s+/g, ' ').trim()
+  if (!normalized) return ''
+
+  try {
+    const response = await fetch(
+      'https://api-inference.huggingface.co/models/oliverguhr/fullstop-punctuation-multilang-large',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer HF_API_KEY',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          inputs: normalized,
+        }),
+      }
+    )
+
+    if (!response.ok) {
+      throw new Error('Punctuation service unavailable')
+    }
+
+    const data = await response.json()
+
+    let corrected = normalized
+
+    if (Array.isArray(data) && data.length > 0) {
+      corrected =
+        data[0]?.generated_text ||
+        data[0]?.translation_text ||
+        data[0]?.summary_text ||
+        normalized
+    } else if (typeof data?.generated_text === 'string') {
+      corrected = data.generated_text
+    } else if (typeof data === 'string') {
+      corrected = data
+    }
+
+    return corrected || formatWithPunctuation(normalized)
+  } catch (error) {
+    console.error(error)
+    return formatWithPunctuation(normalized)
+  }
+}
+
 function App() {
+  const [initialRecordings] = useState<SavedRecording[]>(() => {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return []
+    try {
+      const parsed = JSON.parse(raw) as StoredRecording[]
+      return parsed
+        .map((recording) => ({
+          id: recording.id,
+          text: recording.text,
+          correctedText: recording.correctedText,
+          languageTag: recording.languageTag,
+          languageLabel: recording.languageLabel,
+          createdAt: recording.createdAt,
+          audioBlob: dataUrlToBlob(recording.audioDataUrl, recording.audioType),
+        }))
+        .slice(0, MAX_STORED_CLIPS)
+    } catch {
+      localStorage.removeItem(STORAGE_KEY)
+      return []
+    }
+  })
+
   const [languageTag, setLanguageTag] = useState(LANGUAGES[0].tag)
-  const [recordings, setRecordings] = useState<SavedRecording[]>([])
+  const [recordings, setRecordings] = useState<SavedRecording[]>(initialRecordings)
   const [availableMics, setAvailableMics] = useState<MediaDeviceInfo[]>([])
   const [selectedMicId, setSelectedMicId] = useState('')
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
   const [showCorrectedLiveText, setShowCorrectedLiveText] = useState(false)
-  const [recordingsLoaded, setRecordingsLoaded] = useState(false)
+  const [storageWarning, setStorageWarning] = useState<string | null>(null)
+  const [isCorrectingLiveText, setIsCorrectingLiveText] = useState(false)
+  const [correctedSessionText, setCorrectedSessionText] = useState('')
   const {
     isListening,
     isPaused,
@@ -82,12 +180,12 @@ function App() {
     [interimTranscript, transcript],
   )
   const hasTranscriptText = liveText.length > 0
-  const correctedLiveText = useMemo(() => formatWithPunctuation(liveText), [liveText])
+  const correctedLiveText = correctedSessionText || formatWithPunctuation(liveText)
 
   const refreshMicrophones = useCallback(async () => {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices()
-      const mics = devices.filter((device) => device.kind === 'audioinput')
+      const mics = dedupeMicrophones(devices)
       setAvailableMics(mics)
       setSelectedMicId((current) => {
         if (current && mics.some((mic) => mic.deviceId === current)) return current
@@ -99,7 +197,9 @@ function App() {
   }, [])
 
   useEffect(() => {
-    void refreshMicrophones()
+    window.setTimeout(() => {
+      void refreshMicrophones()
+    }, 0)
     const mediaDevices = navigator.mediaDevices
     if (!mediaDevices) return
 
@@ -111,57 +211,62 @@ function App() {
   }, [refreshMicrophones])
 
   useEffect(() => {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return
-    try {
-      const parsed = JSON.parse(raw) as StoredRecording[]
-      const hydrated = parsed.map((recording) => ({
-        id: recording.id,
-        text: recording.text,
-        correctedText: recording.correctedText,
-        languageTag: recording.languageTag,
-        languageLabel: recording.languageLabel,
-        createdAt: recording.createdAt,
-        audioBlob: dataUrlToBlob(recording.audioDataUrl, recording.audioType),
-      }))
-      setRecordings(hydrated)
-    } catch {
-      localStorage.removeItem(STORAGE_KEY)
-    } finally {
-      setRecordingsLoaded(true)
-    }
-  }, [])
-
-  useEffect(() => {
-    if (!recordingsLoaded) return
-
     const persist = async () => {
-      const stored: StoredRecording[] = await Promise.all(
-        recordings.map(async (recording) => ({
-          id: recording.id,
-          text: recording.text,
-          correctedText: recording.correctedText,
-          languageTag: recording.languageTag,
-          languageLabel: recording.languageLabel,
-          createdAt: recording.createdAt,
-          audioType: recording.audioBlob.type || 'audio/webm',
-          audioDataUrl: await blobToDataUrl(recording.audioBlob),
-        })),
-      )
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(stored))
+      setStorageWarning(null)
+      for (let clipCount = recordings.length; clipCount >= 0; clipCount--) {
+        const subset = recordings.slice(0, clipCount)
+        const stored: StoredRecording[] = await Promise.all(
+          subset.map(async (recording) => ({
+            id: recording.id,
+            text: recording.text,
+            correctedText: recording.correctedText,
+            languageTag: recording.languageTag,
+            languageLabel: recording.languageLabel,
+            createdAt: recording.createdAt,
+            audioType: recording.audioBlob.type || 'audio/webm',
+            audioDataUrl: await blobToDataUrl(recording.audioBlob),
+          })),
+        )
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(stored))
+          if (clipCount !== recordings.length) {
+            setStorageWarning('Some older clips were removed to fit browser storage limits.')
+            setRecordings(subset)
+          }
+          return
+        } catch (error) {
+          if (clipCount === 0) {
+            localStorage.removeItem(STORAGE_KEY)
+            setStorageWarning(getStorageErrorMessage(error))
+            return
+          }
+        }
+      }
     }
 
     void persist()
-  }, [recordings, recordingsLoaded])
+  }, [recordings])
 
   const handleStop = useCallback(async () => {
     const recording = await stop()
     if (recording && (recording.text || recording.audioBlob.size > 0)) {
-      const correctedText = formatWithPunctuation(recording.text)
-      setRecordings((prev) => [{ ...recording, correctedText }, ...prev])
+      setIsCorrectingLiveText(true)
+      const correctedText = await getCorrectedText(recording.text, recording.languageTag)
+      setIsCorrectingLiveText(false)
+      setCorrectedSessionText(correctedText)
+      setRecordings((prev) => [{ ...recording, correctedText }, ...prev].slice(0, MAX_STORED_CLIPS))
       setShowCorrectedLiveText(false)
     }
   }, [stop])
+
+  const handleRemoveRecording = useCallback((id: string) => {
+    setRecordings((prev) => prev.filter((recording) => recording.id !== id))
+  }, [])
+
+  const handleRemoveAllRecordings = useCallback(() => {
+    setRecordings([])
+    localStorage.removeItem(STORAGE_KEY)
+  }, [])
 
   const handleCopyTranscript = useCallback(async () => {
     const text = showCorrectedLiveText ? correctedLiveText : liveText
@@ -178,6 +283,7 @@ function App() {
 
   const handleStart = useCallback(() => {
     setShowCorrectedLiveText(false)
+    setCorrectedSessionText('')
     void start(selectedMicId || undefined)
   }, [selectedMicId, start])
 
@@ -315,6 +421,15 @@ function App() {
               </div>
             )}
 
+            {storageWarning && (
+              <div
+                role="status"
+                className="mb-6 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-100"
+              >
+                {storageWarning}
+              </div>
+            )}
+
             {error && (
               <div
                 role="alert"
@@ -340,7 +455,7 @@ function App() {
                         ? 'Failed'
                         : 'Copy'}
                   </button>
-                  {hasTranscriptText && !isListening && (
+                  {/* {hasTranscriptText && !isListening && (
                     <button
                       type="button"
                       onClick={() => setShowCorrectedLiveText((prev) => !prev)}
@@ -348,7 +463,7 @@ function App() {
                     >
                       {showCorrectedLiveText ? 'Show Original' : 'Show Corrected'}
                     </button>
-                  )}
+                  )} */}
                   {hasTranscriptText && (
                     <button
                       type="button"
@@ -366,6 +481,12 @@ function App() {
                   </span>
                 </div>
               </div>
+
+              {isCorrectingLiveText && !isListening && (
+                <p className="mb-3 text-xs text-indigo-300">
+                  Correcting punctuation for the final transcript...
+                </p>
+              )}
 
               <textarea
                 value={showCorrectedLiveText ? correctedLiveText : transcript}
@@ -394,7 +515,11 @@ function App() {
             </footer>
           </main>
 
-          <RecordingList recordings={recordings} />
+          <RecordingList
+            recordings={recordings}
+            onRemove={handleRemoveRecording}
+            onRemoveAll={handleRemoveAllRecordings}
+          />
         </div>
       </div>
     </div>

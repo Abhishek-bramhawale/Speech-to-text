@@ -112,7 +112,7 @@ export function useSpeechToText(languageTag: string) {
     })
   }, [])
 
-  const attachRecognition = useCallback(() => {
+  const attachRecognition = useCallback(function attachRecognitionImpl() {
     if (!shouldContinueRef.current) return
 
     stopRecognitionInstance()
@@ -167,7 +167,7 @@ export function useSpeechToText(languageTag: string) {
           stopRecognitionInstance()
           clearRetryTimeout()
           retryTimeoutRef.current = window.setTimeout(
-            () => attachRecognition(),
+            () => attachRecognitionImpl(),
             Math.min(400 * networkRetryCountRef.current, 2500),
           )
           return
@@ -191,7 +191,7 @@ export function useSpeechToText(languageTag: string) {
     recognition.onend = () => {
       if (!shouldContinueRef.current || recognitionRef.current !== recognition) return
       clearRetryTimeout()
-      retryTimeoutRef.current = window.setTimeout(() => attachRecognition(), 200)
+      retryTimeoutRef.current = window.setTimeout(() => attachRecognitionImpl(), 200)
     }
 
     recognitionRef.current = recognition
@@ -203,7 +203,7 @@ export function useSpeechToText(languageTag: string) {
       if (!shouldContinueRef.current) return
       setIsReconnecting(true)
       clearRetryTimeout()
-      retryTimeoutRef.current = window.setTimeout(() => attachRecognition(), 400)
+      retryTimeoutRef.current = window.setTimeout(() => attachRecognitionImpl(), 400)
     }
   }, [appendFinalTranscript, clearRetryTimeout, languageTag, stopRecognitionInstance])
 
